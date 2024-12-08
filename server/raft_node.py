@@ -2,7 +2,6 @@ import asyncio
 import grpc
 
 from grpclib.client import Channel
-from grpclib.server import Server
 from grpclib.utils import graceful_exit
 
 from proto import raft_pb2
@@ -17,9 +16,9 @@ from enum import Enum
 from threading import Thread, Lock
 
 class State(Enum):
-    FOLLOWER = 1
-    CANDIDATE = 2
-    LEADER = 3
+    Follower = 1
+    Candidate = 2
+    Leader = 3
 
 class RaftNode:
     def __init__(self, node_id, nodes):
@@ -185,14 +184,15 @@ class RaftNode:
 
 class RaftService(raft_pb2_grpc.RaftConsensusServicer):
     def __init__(self, node):
+        super().__init__()
         self.node = node
 
     def log_is_greater(self, other_term, other_index):
-        if other_term > self.current_term:
+        if other_term > self.node.current_term:
             return True
-        if other_term < self.current_term:
+        if other_term < self.node.current_term:
             return False
-        return other_index >= len(self.log)
+        return other_index >= len(self.node.log)
 
     async def RequestVote(self, stream):
         request = await stream.recv_message()
@@ -201,12 +201,12 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
 
         #ensure leader is up to date
         if self.log_is_greater(request.last_log_term, request.last_log_index):
-            if self.voted_for is None or request.term > self.current_term or s.voted_for == request.candidate_id:
-                self.current_term = request.term
-                self.voted_for = request.candidate_id
-                self.last_heartbeat = time.time()
+            if self.node.voted_for is None or request.term > self.node.current_term or self.nodevoted_for == request.candidate_id:
+                self.node.current_term = request.term
+                self.node.voted_for = request.candidate_id
+                self.node.last_heartbeat = time.time()
 
-                response.term = self.current_term
+                response.term = self.node.current_term
                 response.vote_granted = True
 
         await stream.send_message(response)
@@ -214,25 +214,25 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
     async def work_append_entries(self, request):
         response = raft_pb2.AppendEntriesResponse(term=self.node.current_term, success=False)
 
-        if request.term < self.current_term:
+        if request.term < self.node.current_term:
             return response
 
-        if request.prev_log_index >= len(self.log) or self.log[request.prev_log_index].term != request.prev_log_term:
+        if request.prev_log_index >= len(self.node.log) or self.node.log[request.prev_log_index].term != request.prev_log_term:
             #mistake
             return response
 
         for i, entry in request.entries:
             cur = request.prev_log_index + i + 1
 
-            if cur < len(self.log):
-                if self.log[cur].term != request.term:
-                    self.log = self.log[:cur]
+            if cur < len(self.node.log):
+                if self.node.log[cur].term != request.term:
+                    self.node.log = self.node.log[:cur]
                 else:
                     continue
 
-            self.log.append(entry)
+            self.node.log.append(entry)
 
-
+        response.success = True
         return response 
 
     async def AppendEntries(self, stream):

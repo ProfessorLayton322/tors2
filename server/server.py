@@ -1,4 +1,11 @@
 from flask import Flask, request, jsonify
+from raft_node import RaftNode
+from raft_node import RaftService
+from grpclib.server import Server
+
+import asyncio
+
+import os
 
 app = Flask(__name__)
 
@@ -26,6 +33,26 @@ def handle_key(key):
         print(f"DELETE {key}")
         return jsonify({'success': success})
 
+async def serve(node):
+    server = Server([RaftService(node)])
+    await server.start(node.id.split(':')[0], int(node.id.split(':')[1]))
+    await server.wait_closed()
+
+async def main():
+    #from waitress import serve
+    #serve(app, host='0.0.0.0', port=5000)
+
+    nodes = ['localhost:50051', 'localhost:50052', 'localhost:50053']
+    server_id = int(os.environ["SERV_ID"])
+    server = nodes[server_id]
+
+    global raft_node
+    raft_node = RaftNode(server, nodes)
+
+    _ = await asyncio.gather(
+        serve(raft_node),
+        raft_node.run()
+    )
+
 if __name__ == '__main__':
-    from waitress import serve
-    serve(app, host='0.0.0.0', port=5000)
+    asyncio.run(main())
