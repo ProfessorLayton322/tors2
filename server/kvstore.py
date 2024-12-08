@@ -25,3 +25,8 @@ class KVStore:
         old_value = command.old_value
         if key in self.storage and self.storage[key] == old_value:
             self.storage[key] = value
+
+    def get(self, key):
+        if key in self.storage:
+            return self.storage[key]
+        return ""
