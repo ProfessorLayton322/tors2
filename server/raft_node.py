@@ -1,8 +1,6 @@
 import asyncio
 import grpc
 
-from grpclib.client import Channel
-from grpclib.server import Server
 from grpclib.utils import graceful_exit
 
 from proto import raft_pb2
@@ -17,9 +15,9 @@ from enum import Enum
 from threading import Thread, Lock
 
 class State(Enum):
-    FOLLOWER = 1
-    CANDIDATE = 2
-    LEADER = 3
+    Follower = 1
+    Candidate = 2
+    Leader = 3
 
 class RaftNode:
     def __init__(self, node_id, nodes):
@@ -27,15 +25,15 @@ class RaftNode:
         self.nodes = nodes
         self.state = State.Follower
         self.current_term = 0
-        self.voted_for = None
+        self.voted_for = {}
         self.log = []
         self.commit_index = 0
         self.last_applied = 0
         self.next_index = {node: 1 for node in nodes}
         self.match_index = {node: 0 for node in nodes}
-        self.request_vote_timeout = random.uniform(150, 300) / 1000  # Convert to seconds
-        self.election_timeout = self.request_vote_timeout + 0.1
-        self.heartbeat_interval = 0.05  # 50ms
+        self.request_vote_timeout = random.uniform(150, 300) / 100 # Convert to seconds
+        self.election_timeout = self.request_vote_timeout + 10
+        self.heartbeat_interval = 0.5
         self.last_heartbeat = time.time()
         self.kv_store = KVStore()
         self.lock = Lock()
@@ -43,30 +41,35 @@ class RaftNode:
     async def run(self):
         while True:
             if self.state == State.Follower:
+                print("FOLLOWER")
                 await self.follower_loop()
             if self.state == State.Candidate:
+                print("CANDIDATE")
                 await self.candidate_loop()
             if self.state == State.Leader:
+                print("LEADER")
                 await self.leader_loop()
 
     async def follower_loop(self):
+        print("FOLLOWER LOOP")
         while self.state == State.Follower:
             if time.time() - self.last_heartbeat > self.election_timeout:
                 self.state = State.Candidate
             await asyncio.sleep(0.1)
 
     async def candidate_loop(self):
-        new_term = self.current_term + 1
+        print("STARTING ELECTION")
+        self.current_term += 1
         self.voted_for = self.id
         votes = 1
         
         vote_tasks = []
-        for node in self.nodes:
-            if node == self.id:
+        for i, node in enumerate(self.nodes):
+            if i == self.id:
                 continue
 
             request = raft_pb2.RequestVoteRequest(
-                term=new_term,
+                term=self.current_term,
                 candidate_id=self.id,
                 last_log_index=len(self.log),
                 last_log_term=self.log[-1].term if self.log else 0
@@ -76,41 +79,50 @@ class RaftNode:
         try:
             responses = await asyncio.gather(*vote_tasks, return_exceptions=True)
             for response in responses:
+                print(response)
                 if isinstance(response, Exception):
                     continue  # Skip failed requests
                 if response and response.vote_granted:
+                    print("ACCEPTED")
                     votes += 1
-            
+
             if votes > len(self.nodes) // 2:
                 self.state = State.Leader
-                self.current_term += 1
             else:
+                print("NOT ENOUGH VOTES", votes, len(self.nodes))
                 self.state = State.Follower
+                self.last_heartbeat = time.time()
         except asyncio.TimeoutError:
             self.state = State.Follower
+            self.last_heartbeat = time.time()
 
     async def leader_loop(self):
+        print("I AM LEADER")
         while self.state == State.Leader:
+            print("HELLO FROM LEADER")
             append_tasks = []
-            for node in self.nodes:
-                if node != self.id:
-                    append_tasks.append(self.send_append_entries(node))
-            
+            for i, node in enumerate(self.nodes):
+                if i == self.id:
+                    continue
+                append_tasks.append(self.send_append_entries(node))
+
             await asyncio.gather(*append_tasks, return_exceptions=True)
             await asyncio.sleep(self.heartbeat_interval)
 
     async def send_vote_request(self, node, request):
         try:
-            host, port = node.split(':')
-            channel = Channel(host, int(port))
-            stub = raft_pb2_grpc.RaftConsensusStub(channel)
-            return await asyncio.wait_for(stub.RequestVote(request), timeout=self.election_timeout)
+            print("HERE SENDING", node)
+            async with grpc.aio.insecure_channel(node) as channel:
+                stub = raft_pb2_grpc.RaftConsensusStub(channel)
+                result = await stub.RequestVote(request, timeout=self.election_timeout)
+                print("GOT RESULT BACK")
+                return result
         except asyncio.TimeoutError:
             print(f"Vote request to {node} timed out")
-            return None
         except grpc.RpcError as e:
-            print(f"Failed to send vote request to {node}: {e}")
-            return None
+            #print(f"Failed to send vote request to {node}: {e}")
+            pass
+        return None
 
     async def send_append_entries(self, node):
         next_idx = self.next_index[node]
@@ -141,7 +153,8 @@ class RaftNode:
         except asyncio.TimeoutError:
             print(f"AppendEntries request to {node} timed out")
         except grpc.RpcError as e:
-            print(f"Failed to send AppendEntries to {node}: {e}")
+            #print(f"Failed to send AppendEntries to {node}: {e}")
+            pass
 
     def get(self, key):
         return self.kv_store.get(key)
@@ -185,57 +198,73 @@ class RaftNode:
 
 class RaftService(raft_pb2_grpc.RaftConsensusServicer):
     def __init__(self, node):
+        super().__init__()
         self.node = node
 
     def log_is_greater(self, other_term, other_index):
-        if other_term > self.current_term:
-            return True
-        if other_term < self.current_term:
-            return False
-        return other_index >= len(self.log)
+        log_term = 0
+        if self.node.log:
+            log_term = self.node.log[-1].term
+        print("TERMS", log_term, other_term)
+        print("INDICES", len(self.node.log), other_index)
 
-    async def RequestVote(self, stream):
-        request = await stream.recv_message()
+        if other_term > log_term:
+            print("RETURN TRUE 0")
+            return True
+        if other_term < log_term:
+            print("RETURN FALSE 1")
+            return False
+        return other_index >= len(self.node.log)
+
+    async def RequestVote(self, request, context):
+        print("ACCEPTED VOTE REQUEST")
 
         response = raft_pb2.RequestVoteResponse(term=self.node.current_term, vote_granted=False)
 
-        #ensure leader is up to date
-        if self.log_is_greater(request.last_log_term, request.last_log_index):
-            if self.voted_for is None or request.term > self.current_term or s.voted_for == request.candidate_id:
-                self.current_term = request.term
-                self.voted_for = request.candidate_id
-                self.last_heartbeat = time.time()
-
-                response.term = self.current_term
-                response.vote_granted = True
-
-        await stream.send_message(response)
-
-    async def work_append_entries(self, request):
-        response = raft_pb2.AppendEntriesResponse(term=self.node.current_term, success=False)
-
-        if request.term < self.current_term:
+        if request.term < self.node.current_term:
             return response
 
-        if request.prev_log_index >= len(self.log) or self.log[request.prev_log_index].term != request.prev_log_term:
+        #ensure leader is up to date
+        if not self.log_is_greater(request.last_log_term, request.last_log_index):
+            return response
+
+        if self.node.state != State.Follower:
+            return response
+
+        cur_vote = self.node.voted_for.get(request.term, request.candidate_id)
+        if cur_vote == request.candidate_id:
+            self.node.current_term = request.term
+            self.node.voted_for[request.term] = request.candidate_id
+            self.node.last_heartbeat = time.time()
+
+            response.term = self.node.current_term
+            response.vote_granted = True
+            print("GRANTED VOTE")
+
+        return response
+
+    async def AppendEntries(self, request):
+        print("ACCEPTED HEARBEAT")
+        response = raft_pb2.AppendEntriesResponse(term=self.node.current_term, success=False)
+
+        if request.term < self.node.current_term:
+            return response
+
+        if request.prev_log_index >= len(self.node.log) or self.node.log[request.prev_log_index].term != request.prev_log_term:
             #mistake
             return response
 
         for i, entry in request.entries:
             cur = request.prev_log_index + i + 1
 
-            if cur < len(self.log):
-                if self.log[cur].term != request.term:
-                    self.log = self.log[:cur]
+            if cur < len(self.node.log):
+                if self.node.log[cur].term != request.term:
+                    self.node.log = self.node.log[:cur]
                 else:
                     continue
 
-            self.log.append(entry)
+            self.node.log.append(entry)
 
-
+        response.success = True
+        self.node.last_heartbeat = time.time()
         return response 
-
-    async def AppendEntries(self, stream):
-        request = await stream.recv_message()
-        response = await self.work_append_entries(request)
-        await stream.send_message(response)
