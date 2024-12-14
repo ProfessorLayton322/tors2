@@ -61,11 +61,6 @@ async def main():
     )
 
 if __name__ == '__main__':
-    nodes = ['0.0.0.0:50051', '0.0.0.0:50052', '0.0.0.0:50053']
-    server_id = int(os.environ["SERV_ID"])
-    server = nodes[server_id]
-
     global raft_node
-    raft_node = RaftNode(server_id, nodes)
 
     asyncio.run(main())

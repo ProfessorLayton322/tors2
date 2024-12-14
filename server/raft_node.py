@@ -32,7 +32,8 @@ class RaftNode:
         self.next_index = {node: 1 for node in nodes}
         self.match_index = {node: 0 for node in nodes}
         self.request_vote_timeout = random.uniform(150, 300) / 100 # Convert to seconds
-        self.election_timeout = self.request_vote_timeout + 10
+        self.election_timeout = self.request_vote_timeout + 0.1
+        print(self.election_timeout)
         self.heartbeat_interval = 0.5
         self.last_heartbeat = time.time()
         self.kv_store = KVStore()
@@ -79,12 +80,15 @@ class RaftNode:
         try:
             responses = await asyncio.gather(*vote_tasks, return_exceptions=True)
             for response in responses:
-                print(response)
                 if isinstance(response, Exception):
                     continue  # Skip failed requests
                 if response and response.vote_granted:
                     print("ACCEPTED")
                     votes += 1
+
+            #we gave up our vote for a better leader
+            if self.state == State.Follower:
+                return
 
             if votes > len(self.nodes) // 2:
                 self.state = State.Leader
@@ -97,16 +101,15 @@ class RaftNode:
             self.last_heartbeat = time.time()
 
     async def leader_loop(self):
-        print("I AM LEADER")
         while self.state == State.Leader:
-            print("HELLO FROM LEADER")
+            print("LEADER LOOP")
             append_tasks = []
             for i, node in enumerate(self.nodes):
                 if i == self.id:
                     continue
                 append_tasks.append(self.send_append_entries(node))
 
-            await asyncio.gather(*append_tasks, return_exceptions=True)
+            await asyncio.gather(*append_tasks)
             await asyncio.sleep(self.heartbeat_interval)
 
     async def send_vote_request(self, node, request):
@@ -115,7 +118,6 @@ class RaftNode:
             async with grpc.aio.insecure_channel(node) as channel:
                 stub = raft_pb2_grpc.RaftConsensusStub(channel)
                 result = await stub.RequestVote(request, timeout=self.election_timeout)
-                print("GOT RESULT BACK")
                 return result
         except asyncio.TimeoutError:
             print(f"Vote request to {node} timed out")
@@ -127,8 +129,11 @@ class RaftNode:
     async def send_append_entries(self, node):
         next_idx = self.next_index[node]
         prev_log_index = next_idx - 1
-        prev_log_term = self.log[prev_log_index].term if prev_log_index > 0 else 0
-        entries = self.log[next_idx:]
+        prev_log_term = 0
+        entries = []
+        if prev_log_index < len(self.log):
+            prev_log_term = self.log[prev_log_index].term
+            entries = self.log[next_idx:]
 
         request = raft_pb2.AppendEntriesRequest(
             term=self.current_term,
@@ -140,16 +145,17 @@ class RaftNode:
         )
 
         try:
-            host, port = node.split(':')
-            channel = Channel(host, int(port))
-            stub = raft_pb2_grpc.RaftConsensusStub(channel)
+            async with grpc.aio.insecure_channel(node) as channel:
+                stub = raft_pb2_grpc.RaftConsensusStub(channel)
 
-            response = await asyncio.wait_for(stub.AppendEntries(request), timeout=self.heartbeat_interval)
-            if response.success:
-                self.next_index[node] = len(self.log)
-                self.match_index[node] = len(self.log) - 1
-            else:
-                self.next_index[node] = max(1, self.next_index[node] - 1)
+                response = await stub.AppendEntries(request, timeout=self.heartbeat_interval)
+
+                if response and response.success:
+                    self.next_index[node] = max(1, len(self.log))
+                    self.match_index[node] = len(self.log) - 1
+                else:
+                    self.next_index[node] = max(1, self.next_index[node] - 1)
+
         except asyncio.TimeoutError:
             print(f"AppendEntries request to {node} timed out")
         except grpc.RpcError as e:
@@ -201,35 +207,45 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
         super().__init__()
         self.node = node
 
-    def log_is_greater(self, other_term, other_index):
+    def compare_logs(self, other_term, other_log_term, other_log_index):
         log_term = 0
         if self.node.log:
             log_term = self.node.log[-1].term
-        print("TERMS", log_term, other_term)
-        print("INDICES", len(self.node.log), other_index)
 
-        if other_term > log_term:
-            print("RETURN TRUE 0")
-            return True
-        if other_term < log_term:
-            print("RETURN FALSE 1")
-            return False
-        return other_index >= len(self.node.log)
+        if self.node.current_term > other_term:
+            return -1
+        if self.node.current_term < other_term:
+            return 1
+
+        if log_term > other_log_term:
+            return -1
+        if log_term < other_log_term:
+            return 1
+
+        log_len = len(self.node.log)
+        if log_len > other_log_index:
+            return -1
+        if log_len < other_log_index:
+            return 1
+
+        return 0
 
     async def RequestVote(self, request, context):
         print("ACCEPTED VOTE REQUEST")
 
         response = raft_pb2.RequestVoteResponse(term=self.node.current_term, vote_granted=False)
 
-        if request.term < self.node.current_term:
+        comp = self.compare_logs(request.term, request.last_log_term, request.last_log_index)
+
+        if comp == -1:
             return response
 
-        #ensure leader is up to date
-        if not self.log_is_greater(request.last_log_term, request.last_log_index):
-            return response
-
-        if self.node.state != State.Follower:
-            return response
+        #we might drop our own vote for ourselves, but not other votes
+        if comp == 1 and self.node.state != State.Follower:
+            self.node.State = Follower
+            self.node.last_heartbeat = time.time()
+            if request.term in self.node.voted_for:
+                self.node.voted_for.pop(request.term)
 
         cur_vote = self.node.voted_for.get(request.term, request.candidate_id)
         if cur_vote == request.candidate_id:
@@ -243,12 +259,19 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
 
         return response
 
-    async def AppendEntries(self, request):
-        print("ACCEPTED HEARBEAT")
+    async def AppendEntries(self, request, context):
+        print("ACCEPTED HEARTBEAT")
         response = raft_pb2.AppendEntriesResponse(term=self.node.current_term, success=False)
 
         if request.term < self.node.current_term:
             return response
+        if request.term > self.node.current_term:
+            self.node.current_term = request.term
+
+        if not request.entries:
+            response.success = True
+            self.node.last_heartbeat = time.time()
+            return response 
 
         if request.prev_log_index >= len(self.node.log) or self.node.log[request.prev_log_index].term != request.prev_log_term:
             #mistake
