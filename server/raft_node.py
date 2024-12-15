@@ -32,11 +32,11 @@ class RaftNode:
         self.last_applied = 0
         self.next_index = {node: 1 for node in nodes}
         self.match_index = {node: 0 for node in nodes}
-        self.request_vote_timeout = random.uniform(150, 300) / 100 # Convert to seconds
+        self.request_vote_timeout = random.uniform(150, 300) / 1000 # Convert to seconds
         self.election_timeout = self.request_vote_timeout + 0.1
         print(self.election_timeout)
-        self.update_period = 2
-        self.heartbeat_interval = 0.5
+        self.update_period = 0.1
+        self.heartbeat_interval = 0.05
         self.last_heartbeat = time.time()
         self.kv_store = KVStore()
         self.lock = Lock()
