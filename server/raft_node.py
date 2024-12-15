@@ -232,6 +232,23 @@ class RaftNode:
 
         return await self.add_entry(entry)
 
+    async def compare_swap(self, key, old_value, value):
+        idx = len(self.log)
+
+        command = raft_pb2.Command(
+            command_type=raft_pb2.Command.CommandType.CompareSwap,
+            key=key,
+            value=value,
+            old_value=old_value
+        )
+        entry = raft_pb2.LogEntry(
+            term=self.current_term, 
+            index = idx, 
+            command=command
+        )
+
+        return await self.add_entry(entry)
+
     async def delete(self, key):
         idx = len(self.log)
 
@@ -293,8 +310,6 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
         response = raft_pb2.RequestVoteResponse(term=self.node.current_term, vote_granted=False)
 
         comp = self.compare_logs(request.term, request.last_log_term, request.last_log_index)
-
-        print("Comp", comp)
 
         if comp == -1:
             return response

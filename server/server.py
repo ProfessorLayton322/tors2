@@ -28,8 +28,8 @@ async def create_key():
     data = await request.get_json()
     key = data['key']
     value = data['value']
-    print(f"CREATING KEY {key} {value}")
 
+    print(f"METHOD {request.method} key {key} {value}")
     if raft_node.state != State.Leader:
         return jsonify({'success': False})
 
@@ -37,14 +37,20 @@ async def create_key():
 
     return jsonify({'success': result})
 
-@app.route('/kv/<key>', methods=['GET', 'PUT', 'DELETE'])
+@app.route('/kv/<key>', methods=['GET', 'PUT', 'DELETE', 'PATCH'])
 async def handle_key(key):
     print(f"METHOD {request.method} key {key}")
+
+    global raft_node
+
     if request.method == 'GET':
         value = raft_node.get(key)
         if value is None:
             return jsonify({'success' : False})
         return jsonify({'success': True, 'value' : value})
+
+    if raft_node.state != State.Leader:
+        return jsonify({'success': False})
 
     if request.method == 'PUT':
         data = await request.get_json()
@@ -55,6 +61,14 @@ async def handle_key(key):
 
     if request.method == 'DELETE':
         result = await raft_node.delete(key)
+        return jsonify({'success': result}) 
+
+    if request.method == 'PATCH':
+        data = await request.get_json()
+        value = data['value']
+        old_value = data['old_value']
+
+        result = await raft_node.compare_swap(key, old_value, value)
         return jsonify({'success': result}) 
 
 async def serve():
