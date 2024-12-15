@@ -170,9 +170,6 @@ class RaftNode:
         elif prev_log_index == 0:
             entries = self.log[:]
 
-        if len(entries) > 0:
-            print("Entries ", len(entries), entries)
-
         request = raft_pb2.AppendEntriesRequest(
             term=self.current_term,
             leader_id=self.id,
@@ -291,11 +288,13 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
         return 0
 
     async def RequestVote(self, request, context):
-        print("INCOMING VOTE REQUEST")
+        print("INCOMING VOTE REQUEST", request)
 
         response = raft_pb2.RequestVoteResponse(term=self.node.current_term, vote_granted=False)
 
         comp = self.compare_logs(request.term, request.last_log_term, request.last_log_index)
+
+        print("Comp", comp)
 
         if comp == -1:
             return response

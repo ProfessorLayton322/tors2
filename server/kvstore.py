@@ -6,7 +6,6 @@ class KVStore:
 
     def apply(self, command: Command):
         key = command.key
-        print("KVSTORE OPERATION", key, command)
         if command.command_type == Command.CommandType.Delete:
             if key in self.storage: 
                 del self.storage[key]
