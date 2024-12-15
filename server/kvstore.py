@@ -6,6 +6,7 @@ class KVStore:
 
     def apply(self, command: Command):
         key = command.key
+        print("KVSTORE OPERATION", key, command)
         if command.command_type == Command.CommandType.Delete:
             if key in self.storage: 
                 del self.storage[key]
@@ -27,6 +28,4 @@ class KVStore:
             self.storage[key] = value
 
     def get(self, key):
-        if key in self.storage:
-            return self.storage[key]
-        return ""
+        return self.storage.get(key)

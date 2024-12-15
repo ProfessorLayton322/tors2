@@ -1,5 +1,6 @@
 import asyncio
 import grpc
+import traceback
 
 from grpclib.utils import graceful_exit
 
@@ -34,21 +35,54 @@ class RaftNode:
         self.request_vote_timeout = random.uniform(150, 300) / 100 # Convert to seconds
         self.election_timeout = self.request_vote_timeout + 0.1
         print(self.election_timeout)
+        self.update_period = 2
         self.heartbeat_interval = 0.5
         self.last_heartbeat = time.time()
         self.kv_store = KVStore()
         self.lock = Lock()
 
+    def apply_log(self):
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            entry = self.log[self.last_applied - 1]
+            print(f"APPLYING {self.last_applied} {entry}")
+            self.kv_store.apply(entry.command)
+
+    def commit_indices(self):
+        #to be used only for leader
+        while self.commit_index < len(self.log):
+            calc = 1 #count self
+
+            for i, node in enumerate(self.nodes):
+                if i == self.id:
+                    continue
+                if self.match_index[node] > self.commit_index:
+                    calc += 1
+
+            if calc > len(self.nodes) // 2:
+                self.commit_index += 1
+            else:
+                break
+
+    async def update_loop(self):
+        try:
+            while True:
+                if self.state == State.Leader:
+                    self.commit_indices()
+                self.apply_log()
+                await asyncio.sleep(self.update_period)
+        except Exception:
+            print(traceback.format_exc())
+
     async def run(self):
+        self.update_task = asyncio.create_task(self.update_loop())
+
         while True:
             if self.state == State.Follower:
-                print("FOLLOWER")
                 await self.follower_loop()
             if self.state == State.Candidate:
-                print("CANDIDATE")
                 await self.candidate_loop()
             if self.state == State.Leader:
-                print("LEADER")
                 await self.leader_loop()
 
     async def follower_loop(self):
@@ -83,7 +117,6 @@ class RaftNode:
                 if isinstance(response, Exception):
                     continue  # Skip failed requests
                 if response and response.vote_granted:
-                    print("ACCEPTED")
                     votes += 1
 
             #we gave up our vote for a better leader
@@ -91,6 +124,7 @@ class RaftNode:
                 return
 
             if votes > len(self.nodes) // 2:
+                print("BECAME LEADER")
                 self.state = State.Leader
             else:
                 print("NOT ENOUGH VOTES", votes, len(self.nodes))
@@ -102,7 +136,6 @@ class RaftNode:
 
     async def leader_loop(self):
         while self.state == State.Leader:
-            print("LEADER LOOP")
             append_tasks = []
             for i, node in enumerate(self.nodes):
                 if i == self.id:
@@ -114,7 +147,6 @@ class RaftNode:
 
     async def send_vote_request(self, node, request):
         try:
-            print("HERE SENDING", node)
             async with grpc.aio.insecure_channel(node) as channel:
                 stub = raft_pb2_grpc.RaftConsensusStub(channel)
                 result = await stub.RequestVote(request, timeout=self.election_timeout)
@@ -135,6 +167,11 @@ class RaftNode:
         if prev_log_index <= len(self.log) and prev_log_index > 0:
             prev_log_term = self.log[prev_log_index - 1].term
             entries = self.log[prev_log_index:]
+        elif prev_log_index == 0:
+            entries = self.log[:]
+
+        if len(entries) > 0:
+            print("Entries ", len(entries), entries)
 
         request = raft_pb2.AppendEntriesRequest(
             term=self.current_term,
@@ -166,6 +203,22 @@ class RaftNode:
     def get(self, key):
         return self.kv_store.get(key)
 
+    async def create(self, key, value):
+        idx = len(self.log)
+
+        command = raft_pb2.Command(
+            command_type=raft_pb2.Command.CommandType.Create,
+            key=key,
+            value=value
+        )
+        entry = raft_pb2.LogEntry(
+            term=self.current_term, 
+            index = idx, 
+            command=command
+        )
+
+        return await self.add_entry(entry)
+
     async def put(self, key, value):
         idx = len(self.log)
 
@@ -179,10 +232,10 @@ class RaftNode:
             index = idx, 
             command=command
         )
-        self.log.append(entry)
-        return True
 
-    def delete(self, key):
+        return await self.add_entry(entry)
+
+    async def delete(self, key):
         idx = len(self.log)
 
         command = raft_pb2.Command(
@@ -194,22 +247,20 @@ class RaftNode:
             index = idx, 
             command=command
         )
+
+        return await self.add_entry(entry)
+
+
+    async def add_entry(self, entry):
         self.log.append(entry)
-        return True
+        needed_index = len(self.log)
 
-    def apply_log(self):
-        while self.last_applied < self.commit_index:
-            self.last_applied += 1
-            entry = self.log[self.last_applied - 1]
-            self.kv_store.apply(entry)
-
-    def commit_indices(self):
-        while self.commit_index < len(self.log):
-            calc = 1 #count self
-            for i, node in enumerate(self.nodes):
-                if i == self.id:
-                    continue
-                if match_index[node] >= self.commit
+        while True:
+            if self.state != State.Leader:
+                return False
+            if self.commit_index >= needed_index:
+                return True
+            await asyncio.sleep(self.update_period)
 
 class RaftService(raft_pb2_grpc.RaftConsensusServicer):
     def __init__(self, node):
@@ -240,7 +291,7 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
         return 0
 
     async def RequestVote(self, request, context):
-        print("ACCEPTED VOTE REQUEST")
+        print("INCOMING VOTE REQUEST")
 
         response = raft_pb2.RequestVoteResponse(term=self.node.current_term, vote_granted=False)
 
@@ -265,12 +316,11 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
 
             response.term = self.node.current_term
             response.vote_granted = True
-            print("GRANTED VOTE")
+            print(f"GRANTED VOTE TO {request.candidate_id}")
 
         return response
 
     async def AppendEntries(self, request, context):
-        print("ACCEPTED HEARTBEAT")
         response = raft_pb2.AppendEntriesResponse(term=self.node.current_term, success=False)
 
         if request.term < self.node.current_term:
@@ -280,12 +330,6 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
             #cancel out leadership if a superior leader has appeared
             self.node.state = State.Follower
 
-        #empty heartbeat
-        if not request.entries:
-            response.success = True
-            self.node.last_heartbeat = time.time()
-            return response 
-
         if request.prev_log_index > len(self.node.log):
             #mistake, no such prev_log_index
             return response
@@ -294,16 +338,22 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
             #mistake, logs from older terms
             return response
 
-        for i, entry in request.entries:
+        for i, entry in enumerate(request.entries):
             cur = request.prev_log_index + i
 
             if cur < len(self.node.log):
-                if self.node.log[cur].term != request.term:
+                if self.node.log[cur].term != entry.term:
+                    print(f"CUTTING LOGS TO {cur}")
                     self.node.log = self.node.log[:cur]
                 else:
                     continue
 
+            print(f"APPENDING at {cur}")
             self.node.log.append(entry)
+
+        if request.leader_commit > self.node.commit_index:
+            self.node.commit_index = min(request.leader_commit, len(self.node.log))
+            print(f"Propagating commit to {self.node.commit_index}")
 
         response.success = True
         self.node.last_heartbeat = time.time()
