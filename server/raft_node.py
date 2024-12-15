@@ -130,10 +130,11 @@ class RaftNode:
         next_idx = self.next_index[node]
         prev_log_index = next_idx - 1
         prev_log_term = 0
+
         entries = []
-        if prev_log_index < len(self.log):
-            prev_log_term = self.log[prev_log_index].term
-            entries = self.log[next_idx:]
+        if prev_log_index <= len(self.log) and prev_log_index > 0:
+            prev_log_term = self.log[prev_log_index - 1].term
+            entries = self.log[prev_log_index:]
 
         request = raft_pb2.AppendEntriesRequest(
             term=self.current_term,
@@ -151,8 +152,8 @@ class RaftNode:
                 response = await stub.AppendEntries(request, timeout=self.heartbeat_interval)
 
                 if response and response.success:
-                    self.next_index[node] = max(1, len(self.log))
-                    self.match_index[node] = len(self.log) - 1
+                    self.next_index[node] = len(self.log) + 1
+                    self.match_index[node] = len(self.log)
                 else:
                     self.next_index[node] = max(1, self.next_index[node] - 1)
 
@@ -165,7 +166,7 @@ class RaftNode:
     def get(self, key):
         return self.kv_store.get(key)
 
-    def put(self, key, value):
+    async def put(self, key, value):
         idx = len(self.log)
 
         command = raft_pb2.Command(
@@ -199,8 +200,16 @@ class RaftNode:
     def apply_log(self):
         while self.last_applied < self.commit_index:
             self.last_applied += 1
-            entry = self.log[self.last_applied]
+            entry = self.log[self.last_applied - 1]
             self.kv_store.apply(entry)
+
+    def commit_indices(self):
+        while self.commit_index < len(self.log):
+            calc = 1 #count self
+            for i, node in enumerate(self.nodes):
+                if i == self.id:
+                    continue
+                if match_index[node] >= self.commit
 
 class RaftService(raft_pb2_grpc.RaftConsensusServicer):
     def __init__(self, node):
@@ -243,6 +252,7 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
         #we might drop our own vote for ourselves, but not other votes
         if comp == 1 and self.node.state != State.Follower:
             self.node.State = Follower
+            self.node.current_term = request.term
             self.node.last_heartbeat = time.time()
             if request.term in self.node.voted_for:
                 self.node.voted_for.pop(request.term)
@@ -267,18 +277,25 @@ class RaftService(raft_pb2_grpc.RaftConsensusServicer):
             return response
         if request.term > self.node.current_term:
             self.node.current_term = request.term
+            #cancel out leadership if a superior leader has appeared
+            self.node.state = State.Follower
 
+        #empty heartbeat
         if not request.entries:
             response.success = True
             self.node.last_heartbeat = time.time()
             return response 
 
-        if request.prev_log_index >= len(self.node.log) or self.node.log[request.prev_log_index].term != request.prev_log_term:
-            #mistake
+        if request.prev_log_index > len(self.node.log):
+            #mistake, no such prev_log_index
+            return response
+
+        if request.prev_log_index > 0 and self.node.log[request.prev_log_index - 1].term != request.prev_log_term:
+            #mistake, logs from older terms
             return response
 
         for i, entry in request.entries:
-            cur = request.prev_log_index + i + 1
+            cur = request.prev_log_index + i
 
             if cur < len(self.node.log):
                 if self.node.log[cur].term != request.term:
